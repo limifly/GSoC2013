@@ -1,0 +1,191 @@
+diff --git a/arch/x86/syscalls/syscall_32.tbl b/arch/x86/syscalls/syscall_32.tbl
+index e6d55f0..420858f 100644
+--- a/arch/x86/syscalls/syscall_32.tbl
++++ b/arch/x86/syscalls/syscall_32.tbl
+@@ -357,3 +357,5 @@
+ 348	i386	process_vm_writev	sys_process_vm_writev		compat_sys_process_vm_writev
+ 349	i386	kcmp			sys_kcmp
+ 350	i386	finit_module		sys_finit_module
++351	i386	get_timestamp_vars	sys_get_timestamp_vars
++352	i386	set_timestamp_offset	sys_set_timestamp_offset
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index 313a8e0..f82e8f1 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -258,6 +258,8 @@ asmlinkage long sys_gettimeofday(struct timeval __user *tv,
+ 				struct timezone __user *tz);
+ asmlinkage long sys_settimeofday(struct timeval __user *tv,
+ 				struct timezone __user *tz);
++asmlinkage long sys_get_timestamp_vars(int* counter, int* error, int* offset_second, unsigned int* offset_nanosecond);
++asmlinkage long sys_set_timestamp_offset(int* offset_second, unsigned int* offset_nanosecond);
+ asmlinkage long sys_adjtimex(struct timex __user *txc_p);
+ 
+ asmlinkage long sys_times(struct tms __user *tbuf);
+diff --git a/kernel/posix-timers.c b/kernel/posix-timers.c
+index 6edbb2c..5ddbc0e 100644
+--- a/kernel/posix-timers.c
++++ b/kernel/posix-timers.c
+@@ -963,7 +963,6 @@ SYSCALL_DEFINE2(clock_settime, const clockid_t, which_clock,
+ 
+ 	if (copy_from_user(&new_tp, tp, sizeof (*tp)))
+ 		return -EFAULT;
+-
+ 	return kc->clock_set(which_clock, &new_tp);
+ }
+ 
+diff --git a/kernel/time.c b/kernel/time.c
+index f8342a4..cf8e35a 100644
+--- a/kernel/time.c
++++ b/kernel/time.c
+@@ -27,6 +27,7 @@
+  *	with nanosecond accuracy
+  */
+ 
++
+ #include <linux/export.h>
+ #include <linux/timex.h>
+ #include <linux/capability.h>
+@@ -37,12 +38,15 @@
+ #include <linux/fs.h>
+ #include <linux/math64.h>
+ #include <linux/ptrace.h>
++#include <linux/rtc.h>
+ 
+ #include <asm/uaccess.h>
+ #include <asm/unistd.h>
+ 
+ #include "timeconst.h"
+ 
++#include <linux/jiffies.h>
++
+ /*
+  * The timezone where the local system is located.  Used as a default by some
+  * programs who obtain this value by using gettimeofday.
+@@ -51,6 +55,11 @@ struct timezone sys_tz;
+ 
+ EXPORT_SYMBOL(sys_tz);
+ 
++int discontinuity_count = 0;
++int expected_error = 0;
++unsigned int base_timestamp = 0;
++int expected_offset_second = 0;
++unsigned int expected_offset_nanosecond = 0;
+ #ifdef __ARCH_WANT_SYS_TIME
+ 
+ /*
+@@ -158,6 +167,7 @@ static inline void warp_clock(void)
+  * various programs will get confused when the clock gets warped.
+  */
+ 
++
+ int do_sys_settimeofday(const struct timespec *tv, const struct timezone *tz)
+ {
+ 	static int firsttime = 1;
+@@ -180,7 +190,99 @@ int do_sys_settimeofday(const struct timespec *tv, const struct timezone *tz)
+ 		}
+ 	}
+ 	if (tv)
++	{
++		printk(KERN_INFO "do_sys_settimeofday. \n");
++		discontinuity_count += 1;
+ 		return do_settimeofday(tv);
++	}
++	return 0;
++}
++
++SYSCALL_DEFINE2(set_timestamp_offset, int*, offset_second, unsigned int*, offset_nanosecond)
++{
++	int temp_offset_second = 0;
++	unsigned int temp_offset_nanosecond = 0;
++	if (offset_second && offset_nanosecond) {
++		if (copy_from_user(&temp_offset_second, offset_second, sizeof(*offset_second)))
++			return -EFAULT;
++		expected_offset_second = temp_offset_second;		
++		if (copy_from_user(&temp_offset_nanosecond, offset_nanosecond, sizeof(*offset_nanosecond)))
++			return -EFAULT;
++		expected_offset_nanosecond = temp_offset_nanosecond;
++	
++	}
++	return 0;
++}
++
++SYSCALL_DEFINE4(get_timestamp_vars, int*, counter, int*, error, int*, offset_second, unsigned int*, offset_nanosecond)
++{
++	//unsigned long long j = jiffies_64;
++	
++	int err = -ENODEV;
++	struct rtc_time tm;
++	struct timespec tv = {
++		.tv_nsec = NSEC_PER_SEC >> 1,
++	};
++	struct rtc_device *rtc = rtc_class_open(CONFIG_RTC_HCTOSYS_DEVICE);
++
++	if (rtc == NULL) {
++		printk(KERN_INFO "%s: unable to open rtc device (%s)\n",
++			__FILE__, CONFIG_RTC_HCTOSYS_DEVICE);
++		goto err_open;
++	}
++
++	err = rtc_read_time(rtc, &tm);
++	if (err) {
++		printk(KERN_INFO "get_timestamp_vars: unable to read the hardware clock\n");
++		goto err_read;
++	}
++
++	err = rtc_valid_tm(&tm);
++	if (err) {
++		printk(KERN_INFO "get_timestamp_vars: invalid date/time\n");
++		goto err_invalid;
++	}
++
++	rtc_tm_to_time(&tm, &tv.tv_sec);
++
++
++	printk(KERN_INFO "get_timestamp_vars: RTC time: %d-%02d-%02d %02d:%02d:%02d UTC (%u)\n",
++		tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
++		tm.tm_hour, tm.tm_min, tm.tm_sec,
++		(unsigned int) tv.tv_sec);
++
++err_invalid:
++err_read:
++	rtc_class_close(rtc);
++err_open:
++	if (base_timestamp == 0) {
++		base_timestamp = tv.tv_sec;
++		expected_error = -1;
++	}
++	else {
++		if (tv.tv_sec > base_timestamp) {
++			expected_error = expected_error + (tv.tv_sec-base_timestamp);
++		}
++		base_timestamp = tv.tv_sec;
++	}
++	if (likely(counter != NULL)) {
++		if (copy_to_user(counter, &discontinuity_count, sizeof(int)))
++			return -EFAULT;
++	}
++	if (likely(error != NULL)) {
++		if (copy_to_user(error, &expected_error, sizeof(int)))
++			return -EFAULT;
++	}	
++	if (likely(offset_second != NULL)) {
++		if (copy_to_user(offset_second, &expected_offset_second, sizeof(int)))
++			return -EFAULT;
++	}
++	if (likely(offset_nanosecond != NULL)) {
++		if (copy_to_user(offset_nanosecond, &expected_offset_nanosecond, sizeof(unsigned int)))
++			return -EFAULT;
++	}
++
++
+ 	return 0;
+ }
+ 
+@@ -191,6 +293,7 @@ SYSCALL_DEFINE2(settimeofday, struct timeval __user *, tv,
+ 	struct timespec	new_ts;
+ 	struct timezone new_tz;
+ 
++	printk(KERN_INFO "settimeofday.\n");
+ 	if (tv) {
+ 		if (copy_from_user(&user_tv, tv, sizeof(*tv)))
+ 			return -EFAULT;
